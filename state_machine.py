@@ -9,6 +9,55 @@ from google.genai import types
 logger = logging.getLogger("state_machine")
 logging.basicConfig(level=logging.INFO)
 
+# Global cache for the active discovered model name
+CACHED_ACTIVE_MODEL: Optional[str] = None
+
+def get_or_discover_model(client: genai.Client) -> str:
+    """Discovers available models directly from Google's API to eliminate 404/503 guesswork."""
+    global CACHED_ACTIVE_MODEL
+    if CACHED_ACTIVE_MODEL:
+        return CACHED_ACTIVE_MODEL
+
+    try:
+        available_models = []
+        for m in client.models.list():
+            # Filter for models that support generateContent
+            name = m.name.replace("models/", "")
+            available_models.append(name)
+
+        logger.info(f"Discovered active models for this key: {available_models}")
+
+        # Pick the best available text generation model
+        preferred_order = [
+            "gemini-2.0-flash-exp",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-8b",
+            "gemini-1.5-pro",
+            "gemini-3.8-flash"
+        ]
+
+        for pref in preferred_order:
+            for act in available_models:
+                if pref in act:
+                    CACHED_ACTIVE_MODEL = act
+                    logger.info(f"Selected active model: {CACHED_ACTIVE_MODEL}")
+                    return CACHED_ACTIVE_MODEL
+
+        # Fallback to the first available model if none of preferred match
+        if available_models:
+            CACHED_ACTIVE_MODEL = available_models[0]
+            logger.info(f"Defaulting to first available model: {CACHED_ACTIVE_MODEL}")
+            return CACHED_ACTIVE_MODEL
+
+    except Exception as e:
+        logger.error(f"Model auto-discovery failed: {e}")
+
+    # Ultimate fallback
+    CACHED_ACTIVE_MODEL = "gemini-1.5-flash"
+    return CACHED_ACTIVE_MODEL
+
+
 class CallStateMachine:
     def __init__(self, caller_number: str, contact_name: Optional[str] = None):
         self.caller_number = caller_number
@@ -22,17 +71,17 @@ class CallStateMachine:
         self.client = genai.Client(api_key=api_key) if api_key else None
 
     def get_initial_greeting(self) -> str:
-        """1a: Polite, professional trilingual greeting."""
+        """Rule 1a: Polite trilingual greeting."""
         return "Hello, Namaste, Namaskaram! I am an automated assistant answering on behalf of the user. How can I help you today?"
 
     def detect_and_lock_language(self, caller_text: str) -> str:
-        """1b & 1c: Detect language on Turn 1 and lock permanently."""
-        # Telugu Unicode range or common transliterated words
+        """Rule 1b & 1c: Detect language on Turn 1 and lock permanently."""
+        # Telugu script or common romanized keywords
         has_telugu_script = bool(re.search(r'[\u0C00-\u0C7F]', caller_text))
         telugu_keywords = ["namaskaram", "bagunnara", "cheppandi", "telugu", "enti", "kavalandi", "matladali", "arjent", "urgent"]
         is_telugu = has_telugu_script or any(w in caller_text.lower() for w in telugu_keywords)
 
-        # Devanagari script or common Hindi transliterated words
+        # Devanagari script or common romanized Hindi keywords
         has_hindi_script = bool(re.search(r'[\u0900-\u097F]', caller_text))
         hindi_keywords = ["namaste", "kaise ho", "bataye", "hindi", "kya", "bhai", "haan", "baat", "zaroori"]
         is_hindi = has_hindi_script or any(w in caller_text.lower() for w in hindi_keywords)
@@ -55,68 +104,52 @@ class CallStateMachine:
         current_lang = lang_names.get(self.locked_language, "English")
 
         name_instruction = (
-            f"The caller's identity is verified as '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
+            f"The caller's identity is verified from contacts: '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
             if self.contact_name
             else "The caller's name is UNKNOWN. Politely ask for their full name during the conversation."
         )
 
         return f"""
 Purpose and Goals:
-You are an automated personal phone call assistant answering calls on behalf of the user.
+You are an automated personal phone call assistant answering incoming calls on behalf of the user.
 Speak exclusively and fluently in {current_lang}.
 
 Behaviors and Rules:
-1. Language Lock: Maintain all conversation strictly in {current_lang}. Never switch languages.
+1. Language Lock: Transition immediately and maintain all subsequent conversation strictly in {current_lang}. Never switch languages.
 2. Caller Identity: {name_instruction}
 3. Conversational Cadence: Keep responses concise, clear, and direct. Strictly under 2 short sentences (maximum 25 words).
-4. Direct Connection Guardrail: If asked to speak directly to the user or check availability, say:
+4. Direct Connection Guardrail: If asked to connect directly to the user or check availability, say:
    - Telugu: "వారు ప్రస్తుతం అందుబాటులో లేరు. నేను మీ ముఖ్యమైన సమాచారాన్ని నమోదు చేసి వెంటనే వారికి తెలియజేస్తాను."
    - Hindi: "वे अभी उपलब्ध नहीं हैं। मैं आपका संदेश नोट कर लेता हूँ और उन्हें तुरंत सूचित कर दूँगा।"
    - English: "The user is currently unavailable. I would be glad to take a detailed message and notify them immediately."
-5. Gather Details: Collect caller name (if unknown), call purpose, contact info, and degree of urgency (Urgent vs Standard).
+5. Gather Details: Inquire politely about the purpose of the call, caller's name (if not known), contact info, and degree of urgency (Urgent vs Standard).
 6. Verification & Wrap-up:
-   - Summarize the key points back to the caller in {current_lang} to confirm accuracy.
-   - Thank the caller in {current_lang} and conclude courteousley (e.g., goodbye, ధన్యవాదాలు, धन्यवाद).
+   - Once details are gathered, summarize the key points back to the caller in {current_lang} to confirm accuracy.
+   - Thank the caller in {current_lang} and conclude the call courteously (e.g., goodbye, ధన్యవాదాలు, धन्यवाद).
 7. Format: Conversational spoken dialogue only. No asterisks, markdown, bullet points, or emojis.
 """
 
-    def _call_gemini_with_fallback(self, prompt: str, max_tokens: int = 80) -> Optional[str]:
-        """Calls Gemini using resilient fallbacks and a retry loop for 503 capacity spikes."""
+    def _execute_prompt(self, prompt: str, max_tokens: int = 80) -> Optional[str]:
         if not self.client:
             return None
 
-        # Prioritize stable flash and pro models to bypass regional 503 bottlenecks
-        target_models = [
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-pro-latest",
-            "gemini-3.8-flash"
-        ]
+        model_name = get_or_discover_model(self.client)
 
-        for model_name in target_models:
-            for attempt in range(2):
-                try:
-                    response = self.client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.2,
-                            max_output_tokens=max_tokens,
-                        ),
-                    )
-                    if response.text:
-                        return re.sub(r'[*_#`]', '', response.text).strip()
-                except Exception as e:
-                    err_msg = str(e)
-                    if "503" in err_msg or "UNAVAILABLE" in err_msg:
-                        logger.warning(f"{model_name} high demand (503). Retrying in 1s...")
-                        time.sleep(1.0)
-                        continue
-                    elif "404" in err_msg or "NOT_FOUND" in err_msg:
-                        logger.info(f"{model_name} not available, trying next candidate...")
-                        break
-                    else:
-                        logger.warning(f"Unexpected error with {model_name}: {e}")
-                        break
+        for attempt in range(2):
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        max_output_tokens=max_tokens,
+                    ),
+                )
+                if response.text:
+                    return re.sub(r'[*_#`]', '', response.text).strip()
+            except Exception as e:
+                logger.warning(f"Execution error on model {model_name} (attempt {attempt+1}): {e}")
+                time.sleep(1.0)
         return None
 
     async def process_turn(self, caller_text: str) -> str:
@@ -133,7 +166,7 @@ Behaviors and Rules:
             conversation_context += f"{speaker}: {turn['text']}\n"
         conversation_context += "Assistant:"
 
-        clean_reply = self._call_gemini_with_fallback(conversation_context, max_tokens=80)
+        clean_reply = self._execute_prompt(conversation_context, max_tokens=80)
 
         if clean_reply:
             self.history.append({"role": "model", "text": clean_reply})
@@ -178,7 +211,7 @@ Message: <details>
 ముఖ్యత: <Urgent/Standard in Telugu>
 సందేశం: <details in Telugu>
 """
-        summary_result = self._call_gemini_with_fallback(summary_prompt, max_tokens=300)
+        summary_result = self._execute_prompt(summary_prompt, max_tokens=300)
 
         if summary_result and "---TELUGU---" in summary_result:
             parts = summary_result.split("---TELUGU---")
