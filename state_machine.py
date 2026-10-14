@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import logging
 from typing import Optional, Dict, Any, List
 from google import genai
@@ -9,54 +8,8 @@ from google.genai import types
 logger = logging.getLogger("state_machine")
 logging.basicConfig(level=logging.INFO)
 
-# Global cache for the active discovered model name
-CACHED_ACTIVE_MODEL: Optional[str] = None
-
-def get_or_discover_model(client: genai.Client) -> str:
-    """Discovers available models directly from Google's API to eliminate 404/503 guesswork."""
-    global CACHED_ACTIVE_MODEL
-    if CACHED_ACTIVE_MODEL:
-        return CACHED_ACTIVE_MODEL
-
-    try:
-        available_models = []
-        for m in client.models.list():
-            # Filter for models that support generateContent
-            name = m.name.replace("models/", "")
-            available_models.append(name)
-
-        logger.info(f"Discovered active models for this key: {available_models}")
-
-        # Pick the best available text generation model
-        preferred_order = [
-            "gemini-2.0-flash-exp",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-8b",
-            "gemini-1.5-pro",
-            "gemini-3.8-flash"
-        ]
-
-        for pref in preferred_order:
-            for act in available_models:
-                if pref in act:
-                    CACHED_ACTIVE_MODEL = act
-                    logger.info(f"Selected active model: {CACHED_ACTIVE_MODEL}")
-                    return CACHED_ACTIVE_MODEL
-
-        # Fallback to the first available model if none of preferred match
-        if available_models:
-            CACHED_ACTIVE_MODEL = available_models[0]
-            logger.info(f"Defaulting to first available model: {CACHED_ACTIVE_MODEL}")
-            return CACHED_ACTIVE_MODEL
-
-    except Exception as e:
-        logger.error(f"Model auto-discovery failed: {e}")
-
-    # Ultimate fallback
-    CACHED_ACTIVE_MODEL = "gemini-1.5-flash"
-    return CACHED_ACTIVE_MODEL
-
+# Use the active alias discovered from your API key that does not suffer from 503 spikes
+TARGET_MODEL = "gemini-flash-latest"
 
 class CallStateMachine:
     def __init__(self, caller_number: str, contact_name: Optional[str] = None):
@@ -76,12 +29,12 @@ class CallStateMachine:
 
     def detect_and_lock_language(self, caller_text: str) -> str:
         """Rule 1b & 1c: Detect language on Turn 1 and lock permanently."""
-        # Telugu script or common romanized keywords
+        # Telugu Unicode or phonetic romanized cues
         has_telugu_script = bool(re.search(r'[\u0C00-\u0C7F]', caller_text))
         telugu_keywords = ["namaskaram", "bagunnara", "cheppandi", "telugu", "enti", "kavalandi", "matladali", "arjent", "urgent"]
         is_telugu = has_telugu_script or any(w in caller_text.lower() for w in telugu_keywords)
 
-        # Devanagari script or common romanized Hindi keywords
+        # Devanagari Unicode or phonetic Hindi cues
         has_hindi_script = bool(re.search(r'[\u0900-\u097F]', caller_text))
         hindi_keywords = ["namaste", "kaise ho", "bataye", "hindi", "kya", "bhai", "haan", "baat", "zaroori"]
         is_hindi = has_hindi_script or any(w in caller_text.lower() for w in hindi_keywords)
@@ -104,7 +57,7 @@ class CallStateMachine:
         current_lang = lang_names.get(self.locked_language, "English")
 
         name_instruction = (
-            f"The caller's identity is verified from contacts: '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
+            f"The caller's identity is verified from contacts as '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
             if self.contact_name
             else "The caller's name is UNKNOWN. Politely ask for their full name during the conversation."
         )
@@ -129,13 +82,16 @@ Behaviors and Rules:
 7. Format: Conversational spoken dialogue only. No asterisks, markdown, bullet points, or emojis.
 """
 
-    def _execute_prompt(self, prompt: str, max_tokens: int = 80) -> Optional[str]:
+    def _generate_ai_reply(self, prompt: str, max_tokens: int = 80) -> Optional[str]:
+        """Calls the discovered active gemini-flash-latest model."""
         if not self.client:
+            logger.error("No Gemini Client initialized.")
             return None
 
-        model_name = get_or_discover_model(self.client)
+        # Prioritize gemini-flash-latest followed by gemini-2.5-flash
+        models_to_try = [TARGET_MODEL, "gemini-2.5-flash"]
 
-        for attempt in range(2):
+        for model_name in models_to_try:
             try:
                 response = self.client.models.generate_content(
                     model=model_name,
@@ -148,8 +104,7 @@ Behaviors and Rules:
                 if response.text:
                     return re.sub(r'[*_#`]', '', response.text).strip()
             except Exception as e:
-                logger.warning(f"Execution error on model {model_name} (attempt {attempt+1}): {e}")
-                time.sleep(1.0)
+                logger.warning(f"Generation attempt on {model_name} failed: {e}")
         return None
 
     async def process_turn(self, caller_text: str) -> str:
@@ -166,7 +121,7 @@ Behaviors and Rules:
             conversation_context += f"{speaker}: {turn['text']}\n"
         conversation_context += "Assistant:"
 
-        clean_reply = self._execute_prompt(conversation_context, max_tokens=80)
+        clean_reply = self._generate_ai_reply(conversation_context, max_tokens=80)
 
         if clean_reply:
             self.history.append({"role": "model", "text": clean_reply})
@@ -211,7 +166,7 @@ Message: <details>
 ముఖ్యత: <Urgent/Standard in Telugu>
 సందేశం: <details in Telugu>
 """
-        summary_result = self._execute_prompt(summary_prompt, max_tokens=300)
+        summary_result = self._generate_ai_reply(summary_prompt, max_tokens=300)
 
         if summary_result and "---TELUGU---" in summary_result:
             parts = summary_result.split("---TELUGU---")
