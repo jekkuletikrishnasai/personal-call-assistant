@@ -32,7 +32,7 @@ async def keep_alive_task():
                 logger.info(f"Keep-alive self-ping status: {res.status_code}")
             except Exception as e:
                 logger.warning(f"Keep-alive ping failed: {e}")
-            await asyncio.sleep(40)  # Ping safely inside Render's idle threshold
+            await asyncio.sleep(15)  # Ping safely inside Render's idle threshold
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
