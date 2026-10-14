@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import time
 from typing import Optional, Dict, Any, List
 from google import genai
 from google.genai import types
@@ -8,8 +9,13 @@ from google.genai import types
 logger = logging.getLogger("state_machine")
 logging.basicConfig(level=logging.INFO)
 
-# Use the active alias discovered from your API key that does not suffer from 503 spikes
-TARGET_MODEL = "gemini-flash-latest"
+# High-availability low-latency models from your key's discovered list
+PRIORITY_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest"
+]
 
 class CallStateMachine:
     def __init__(self, caller_number: str, contact_name: Optional[str] = None):
@@ -24,17 +30,17 @@ class CallStateMachine:
         self.client = genai.Client(api_key=api_key) if api_key else None
 
     def get_initial_greeting(self) -> str:
-        """Rule 1a: Polite trilingual greeting."""
+        """Rule 1a: Answer with a polite, professional trilingual greeting."""
         return "Hello, Namaste, Namaskaram! I am an automated assistant answering on behalf of the user. How can I help you today?"
 
     def detect_and_lock_language(self, caller_text: str) -> str:
         """Rule 1b & 1c: Detect language on Turn 1 and lock permanently."""
-        # Telugu Unicode or phonetic romanized cues
+        # Telugu script or common romanized keywords
         has_telugu_script = bool(re.search(r'[\u0C00-\u0C7F]', caller_text))
         telugu_keywords = ["namaskaram", "bagunnara", "cheppandi", "telugu", "enti", "kavalandi", "matladali", "arjent", "urgent"]
         is_telugu = has_telugu_script or any(w in caller_text.lower() for w in telugu_keywords)
 
-        # Devanagari Unicode or phonetic Hindi cues
+        # Devanagari script or common romanized Hindi keywords
         has_hindi_script = bool(re.search(r'[\u0900-\u097F]', caller_text))
         hindi_keywords = ["namaste", "kaise ho", "bataye", "hindi", "kya", "bhai", "haan", "baat", "zaroori"]
         is_hindi = has_hindi_script or any(w in caller_text.lower() for w in hindi_keywords)
@@ -70,7 +76,7 @@ Speak exclusively and fluently in {current_lang}.
 Behaviors and Rules:
 1. Language Lock: Transition immediately and maintain all subsequent conversation strictly in {current_lang}. Never switch languages.
 2. Caller Identity: {name_instruction}
-3. Conversational Cadence: Keep responses concise, clear, and direct. Strictly under 2 short sentences (maximum 25 words).
+3. Conversational Cadence: Keep responses concise, clear, and direct (strictly 1 to 2 short sentences, maximum 25 words).
 4. Direct Connection Guardrail: If asked to connect directly to the user or check availability, say:
    - Telugu: "వారు ప్రస్తుతం అందుబాటులో లేరు. నేను మీ ముఖ్యమైన సమాచారాన్ని నమోదు చేసి వెంటనే వారికి తెలియజేస్తాను."
    - Hindi: "वे अभी उपलब्ध नहीं हैं। मैं आपका संदेश नोट कर लेता हूँ और उन्हें तुरंत सूचित कर दूँगा।"
@@ -83,15 +89,11 @@ Behaviors and Rules:
 """
 
     def _generate_ai_reply(self, prompt: str, max_tokens: int = 80) -> Optional[str]:
-        """Calls the discovered active gemini-flash-latest model."""
         if not self.client:
             logger.error("No Gemini Client initialized.")
             return None
 
-        # Prioritize gemini-flash-latest followed by gemini-2.5-flash
-        models_to_try = [TARGET_MODEL, "gemini-2.5-flash"]
-
-        for model_name in models_to_try:
+        for model_name in PRIORITY_MODELS:
             try:
                 response = self.client.models.generate_content(
                     model=model_name,
@@ -102,9 +104,19 @@ Behaviors and Rules:
                     ),
                 )
                 if response.text:
+                    logger.info(f"Successfully generated reply using model: {model_name}")
                     return re.sub(r'[*_#`]', '', response.text).strip()
             except Exception as e:
-                logger.warning(f"Generation attempt on {model_name} failed: {e}")
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    logger.warning(f"{model_name} busy (503). Trying next model...")
+                    continue
+                elif "404" in err_str or "NOT_FOUND" in err_str:
+                    logger.warning(f"{model_name} not found (404). Trying next model...")
+                    continue
+                else:
+                    logger.warning(f"Error on {model_name}: {e}")
+                    continue
         return None
 
     async def process_turn(self, caller_text: str) -> str:
