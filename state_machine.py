@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import asyncio
 import httpx
 from typing import Optional, Dict, Any, List
 
@@ -76,6 +77,43 @@ Behaviors and Rules:
 7. Format: Spoken dialogue only. Never use asterisks (*), markdown, bullet points, or emojis.
 """
 
+    async def _query_gemini(self, payload: dict, api_key: str) -> Optional[str]:
+        """Queries Google Gemini with automated fallback across available models and retry on 503."""
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key
+        }
+        
+        # Primary model with automatic fallbacks if one encounters 503 high demand
+        candidate_models = [
+            "gemini-3.8-flash",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash"
+        ]
+
+        async with httpx.AsyncClient() as client:
+            for model_name in candidate_models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+                
+                # Attempt up to 2 times per model if a 503 spike occurs
+                for attempt in range(2):
+                    try:
+                        res = await client.post(url, json=payload, headers=headers, timeout=12.0)
+                        if res.status_code == 200:
+                            data = res.json()
+                            reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            return re.sub(r'[*_#`]', '', reply)
+                        elif res.status_code == 503:
+                            logger.warning(f"{model_name} returned 503 high demand (attempt {attempt+1}). Retrying...")
+                            await asyncio.sleep(0.5)
+                        else:
+                            logger.warning(f"{model_name} failed with status {res.status_code}: {res.text}")
+                            break  # Move to next model if not a temporary 503
+                    except Exception as e:
+                        logger.error(f"Error querying {model_name}: {e}")
+                        break
+        return None
+
     async def process_turn(self, caller_text: str) -> str:
         self.turn_count += 1
 
@@ -103,31 +141,13 @@ Behaviors and Rules:
             }
         }
 
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key
-        }
+        clean_reply = await self._query_gemini(payload, api_key)
 
-        # Updated model endpoint required for current AI Studio keys
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
-
-        try:
-            async with httpx.AsyncClient() as client:
-                res = await client.post(url, json=payload, headers=headers, timeout=12.0)
-                if res.status_code == 200:
-                    data = res.json()
-                    reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    clean_reply = re.sub(r'[*_#`]', '', reply)
-                    self.history.append({"role": "model", "parts": [{"text": clean_reply}]})
-
-                    if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
-                        self.is_completed = True
-
-                    return clean_reply
-                else:
-                    logger.error(f"Gemini API Error [{res.status_code}]: {res.text}")
-        except Exception as e:
-            logger.error(f"HTTP Connection Exception: {e}")
+        if clean_reply:
+            self.history.append({"role": "model", "parts": [{"text": clean_reply}]})
+            if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
+                self.is_completed = True
+            return clean_reply
 
         return self._fallback_reply()
 
@@ -150,7 +170,7 @@ Behaviors and Rules:
         ])
 
         summary_prompt = f"""
-Summarize this call transcript in two distinct sections: English and Telugu.
+Summarize this call transcript into two distinct sections: English and Telugu.
 Caller Contact Name: {self.contact_name or 'Unknown'}
 Caller Phone: {self.caller_number}
 
@@ -174,21 +194,12 @@ Message: <details>
             "contents": [{"role": "user", "parts": [{"text": summary_prompt}]}],
             "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300}
         }
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key
-        }
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 
-        try:
-            async with httpx.AsyncClient() as client:
-                res = await client.post(url, json=payload, headers=headers, timeout=12.0)
-                if res.status_code == 200:
-                    raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    parts = raw_text.split("---TELUGU---")
-                    english_part = parts[0].replace("---ENGLISH---", "").strip()
-                    telugu_part = parts[1].strip() if len(parts) > 1 else "వివరాలు నమోదు చేయబడ్డాయి."
-                    return {"english": english_part, "telugu": telugu_part}
-        except Exception:
-            pass
+        summary_text = await self._query_gemini(payload, api_key)
+        if summary_text and "---TELUGU---" in summary_text:
+            parts = summary_text.split("---TELUGU---")
+            english_part = parts[0].replace("---ENGLISH---", "").strip()
+            telugu_part = parts[1].strip()
+            return {"english": english_part, "telugu": telugu_part}
+
         return {"english": transcript_text, "telugu": transcript_text}
