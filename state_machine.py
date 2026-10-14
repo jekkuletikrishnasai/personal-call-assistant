@@ -23,13 +23,15 @@ class CallStateMachine:
 
     def detect_and_lock_language(self, caller_text: str) -> str:
         """Rule 1b & 1c: Detect language on Turn 1 and lock permanently."""
+        # Telugu script or romanized cues
         has_telugu_script = bool(re.search(r'[\u0C00-\u0C7F]', caller_text))
-        telugu_words = ["namaskaram", "bagunnara", "cheppandi", "telugu", "enti", "kavalandi", "matladali", "arjent", "urgent"]
-        is_telugu = has_telugu_script or any(w in caller_text.lower() for w in telugu_words)
+        telugu_keywords = ["namaskaram", "bagunnara", "cheppandi", "telugu", "enti", "kavalandi", "matladali", "arjent", "urgent"]
+        is_telugu = has_telugu_script or any(w in caller_text.lower() for w in telugu_keywords)
 
+        # Devanagari script or romanized Hindi cues
         has_hindi_script = bool(re.search(r'[\u0900-\u097F]', caller_text))
-        hindi_words = ["namaste", "kaise ho", "bataye", "hindi", "kya", "bhai", "haan", "baat", "zaroori"]
-        is_hindi = has_hindi_script or any(w in caller_text.lower() for w in hindi_words)
+        hindi_keywords = ["namaste", "kaise ho", "bataye", "hindi", "kya", "bhai", "haan", "baat", "zaroori"]
+        is_hindi = has_hindi_script or any(w in caller_text.lower() for w in hindi_keywords)
 
         if is_telugu:
             self.locked_language = "te"
@@ -51,7 +53,7 @@ class CallStateMachine:
         name_instruction = (
             f"The caller's identity is verified from contacts: '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
             if self.contact_name
-            else "The caller's name is UNKNOWN (only phone number available). Politely ask for their full name during the conversation."
+            else "The contact name is UNKNOWN (only phone number available). Politely ask for their full name during the conversation."
         )
 
         return f"""
@@ -61,7 +63,7 @@ Speak fluently and exclusively in {current_lang}.
 
 Behaviors and Rules:
 1. Language Lock: Transition immediately and maintain all subsequent conversation strictly in {current_lang}. Never switch languages.
-2. Caller Name: {name_instruction}
+2. Caller Identity: {name_instruction}
 3. Conversational Turns: Keep responses concise, clear, and direct (strictly 1 to 2 short sentences, maximum 25 words).
 4. Direct Connection Guardrail: If asked to connect directly to the user or check availability, politely inform the caller of the user's availability and offer to log a detailed message:
    - Telugu: "వారు ప్రస్తుతం అందుబాటులో లేరు. నేను మీ ముఖ్యమైన సమాచారాన్ని నమోదు చేసి వెంటనే వారికి తెలియజేస్తాను."
@@ -69,7 +71,7 @@ Behaviors and Rules:
    - English: "The user is currently unavailable. I would be glad to take a detailed message and notify them immediately."
 5. Gather Details: Inquire politely about the purpose of the call, caller's name (if not known), contact info, and degree of urgency (Urgent vs Standard).
 6. Verification & Wrap-up:
-   - Summarize the key points back to the caller in {current_lang} to confirm accuracy.
+   - Once details are gathered, summarize the key points back to the caller in {current_lang} to confirm accuracy.
    - Thank the caller in {current_lang} and conclude the call courteously (e.g., goodbye, ధన్యవాదాలు, धन्यवाद).
 7. Format: Spoken dialogue only. Never use asterisks (*), markdown, bullet points, or emojis.
 """
@@ -82,7 +84,7 @@ Behaviors and Rules:
 
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key:
-            logger.error("GEMINI_API_KEY is not configured.")
+            logger.error("GEMINI_API_KEY is missing from environment.")
             return self._fallback_reply()
 
         self.history.append({"role": "user", "parts": [{"text": caller_text}]})
@@ -92,7 +94,7 @@ Behaviors and Rules:
             "contents": [
                 {
                     "role": "user",
-                    "parts": [{"text": f"Instructions:\n{instructions}\n\nCaller message:\n{caller_text}"}]
+                    "parts": [{"text": f"System Instructions:\n{instructions}\n\nCaller message:\n{caller_text}"}]
                 }
             ],
             "generationConfig": {
@@ -101,37 +103,31 @@ Behaviors and Rules:
             }
         }
 
-        # Header-based authentication works for both standard keys and AQ keys
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": api_key
         }
 
-        # Candidate endpoints to query
-        endpoints = [
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
-            "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
-        ]
+        # Updated model endpoint required for current AI Studio keys
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 
-        async with httpx.AsyncClient() as client:
-            for url in endpoints:
-                try:
-                    res = await client.post(url, json=payload, headers=headers, timeout=12.0)
-                    if res.status_code == 200:
-                        data = res.json()
-                        reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        clean_reply = re.sub(r'[*_#`]', '', reply)
-                        self.history.append({"role": "model", "parts": [{"text": clean_reply}]})
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.post(url, json=payload, headers=headers, timeout=12.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    clean_reply = re.sub(r'[*_#`]', '', reply)
+                    self.history.append({"role": "model", "parts": [{"text": clean_reply}]})
 
-                        if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
-                            self.is_completed = True
+                    if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
+                        self.is_completed = True
 
-                        return clean_reply
-                    else:
-                        logger.warning(f"Endpoint {url} returned {res.status_code}: {res.text}")
-                except Exception as e:
-                    logger.error(f"HTTP request error on {url}: {e}")
+                    return clean_reply
+                else:
+                    logger.error(f"Gemini API Error [{res.status_code}]: {res.text}")
+        except Exception as e:
+            logger.error(f"HTTP Connection Exception: {e}")
 
         return self._fallback_reply()
 
@@ -143,7 +139,7 @@ Behaviors and Rules:
         return "I apologize, could you please repeat that?"
 
     async def generate_bilingual_summary(self) -> Dict[str, str]:
-        """Summarizes transcript in English and Telugu only."""
+        """Summarizes transcript strictly in English and Telugu."""
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key:
             return {"english": "Summary unavailable", "telugu": "సారాంశం అందుబాటులో లేదు"}
@@ -182,7 +178,7 @@ Message: <details>
             "Content-Type": "application/json",
             "x-goog-api-key": api_key
         }
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 
         try:
             async with httpx.AsyncClient() as client:
