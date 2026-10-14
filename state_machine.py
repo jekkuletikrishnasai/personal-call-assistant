@@ -1,10 +1,9 @@
 import os
 import re
-import json
 import logging
-import asyncio
-import httpx
 from typing import Optional, Dict, Any, List
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger("state_machine")
 logging.basicConfig(level=logging.INFO)
@@ -14,22 +13,24 @@ class CallStateMachine:
         self.caller_number = caller_number
         self.contact_name = contact_name.strip() if contact_name and contact_name.strip() else None
         self.locked_language: Optional[str] = None  # 'te', 'hi', or 'en'
-        self.history: List[Dict[str, Any]] = []
+        self.history: List[Dict[str, str]] = []
         self.turn_count = 0
         self.is_completed = False
 
+        # Initialize Google GenAI Client
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.client = genai.Client(api_key=api_key) if api_key else None
+
     def get_initial_greeting(self) -> str:
-        """Rule 1a: Answer with a polite, professional trilingual greeting."""
+        """Rule 1a: Polite trilingual greeting."""
         return "Hello, Namaste, Namaskaram! I am an automated assistant answering on behalf of the user. How can I help you today?"
 
     def detect_and_lock_language(self, caller_text: str) -> str:
         """Rule 1b & 1c: Detect language on Turn 1 and lock permanently."""
-        # Telugu script or romanized cues
         has_telugu_script = bool(re.search(r'[\u0C00-\u0C7F]', caller_text))
         telugu_keywords = ["namaskaram", "bagunnara", "cheppandi", "telugu", "enti", "kavalandi", "matladali", "arjent", "urgent"]
         is_telugu = has_telugu_script or any(w in caller_text.lower() for w in telugu_keywords)
 
-        # Devanagari script or romanized Hindi cues
         has_hindi_script = bool(re.search(r'[\u0900-\u097F]', caller_text))
         hindi_keywords = ["namaste", "kaise ho", "bataye", "hindi", "kya", "bhai", "haan", "baat", "zaroori"]
         is_hindi = has_hindi_script or any(w in caller_text.lower() for w in hindi_keywords)
@@ -54,7 +55,7 @@ class CallStateMachine:
         name_instruction = (
             f"The caller's identity is verified from contacts: '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
             if self.contact_name
-            else "The contact name is UNKNOWN (only phone number available). Politely ask for their full name during the conversation."
+            else "The caller's name is UNKNOWN. Ask for their full name politely."
         )
 
         return f"""
@@ -77,77 +78,49 @@ Behaviors and Rules:
 7. Format: Spoken dialogue only. Never use asterisks (*), markdown, bullet points, or emojis.
 """
 
-    async def _query_gemini(self, payload: dict, api_key: str) -> Optional[str]:
-        """Queries Google Gemini with automated fallback across available models and retry on 503."""
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key
-        }
-        
-        # Primary model with automatic fallbacks if one encounters 503 high demand
-        candidate_models = [
-            "gemini-3.8-flash",
-            "gemini-2.0-flash",
-            "gemini-2.5-flash"
-        ]
-
-        async with httpx.AsyncClient() as client:
-            for model_name in candidate_models:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-                
-                # Attempt up to 2 times per model if a 503 spike occurs
-                for attempt in range(2):
-                    try:
-                        res = await client.post(url, json=payload, headers=headers, timeout=12.0)
-                        if res.status_code == 200:
-                            data = res.json()
-                            reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                            return re.sub(r'[*_#`]', '', reply)
-                        elif res.status_code == 503:
-                            logger.warning(f"{model_name} returned 503 high demand (attempt {attempt+1}). Retrying...")
-                            await asyncio.sleep(0.5)
-                        else:
-                            logger.warning(f"{model_name} failed with status {res.status_code}: {res.text}")
-                            break  # Move to next model if not a temporary 503
-                    except Exception as e:
-                        logger.error(f"Error querying {model_name}: {e}")
-                        break
-        return None
-
     async def process_turn(self, caller_text: str) -> str:
         self.turn_count += 1
 
         if not self.locked_language:
             self.detect_and_lock_language(caller_text)
 
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not api_key:
-            logger.error("GEMINI_API_KEY is missing from environment.")
+        if not self.client:
+            logger.error("GEMINI_API_KEY environment variable is not configured.")
             return self._fallback_reply()
 
-        self.history.append({"role": "user", "parts": [{"text": caller_text}]})
+        self.history.append({"role": "user", "text": caller_text})
 
-        instructions = self._build_system_prompt()
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": f"System Instructions:\n{instructions}\n\nCaller message:\n{caller_text}"}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 80
-            }
-        }
+        # Format conversation messages for the client
+        conversation_context = f"System Instructions:\n{self._build_system_prompt()}\n\n"
+        for turn in self.history:
+            speaker = "Caller" if turn["role"] == "user" else "Assistant"
+            conversation_context += f"{speaker}: {turn['text']}\n"
+        conversation_context += "Assistant:"
 
-        clean_reply = await self._query_gemini(payload, api_key)
+        # Try active models via official SDK
+        active_models = ["gemini-2.5-flash", "gemini-3.8-flash"]
 
-        if clean_reply:
-            self.history.append({"role": "model", "parts": [{"text": clean_reply}]})
-            if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
-                self.is_completed = True
-            return clean_reply
+        for model_name in active_models:
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=conversation_context,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        max_output_tokens=85,
+                    ),
+                )
+
+                if response.text:
+                    clean_reply = re.sub(r'[*_#`]', '', response.text).strip()
+                    self.history.append({"role": "model", "text": clean_reply})
+
+                    if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
+                        self.is_completed = True
+
+                    return clean_reply
+            except Exception as e:
+                logger.warning(f"SDK call on {model_name} failed: {e}")
 
         return self._fallback_reply()
 
@@ -160,12 +133,11 @@ Behaviors and Rules:
 
     async def generate_bilingual_summary(self) -> Dict[str, str]:
         """Summarizes transcript strictly in English and Telugu."""
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not api_key:
+        if not self.client:
             return {"english": "Summary unavailable", "telugu": "సారాంశం అందుబాటులో లేదు"}
 
         transcript_text = "\n".join([
-            f"{'Caller' if m['role'] == 'user' else 'AI'}: {m['parts'][0]['text']}"
+            f"{'Caller' if m['role'] == 'user' else 'AI'}: {m['text']}"
             for m in self.history
         ])
 
@@ -190,16 +162,22 @@ Message: <details>
 ముఖ్యత: <Urgent/Standard in Telugu>
 సందేశం: <details in Telugu>
 """
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": summary_prompt}]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300}
-        }
-
-        summary_text = await self._query_gemini(payload, api_key)
-        if summary_text and "---TELUGU---" in summary_text:
-            parts = summary_text.split("---TELUGU---")
-            english_part = parts[0].replace("---ENGLISH---", "").strip()
-            telugu_part = parts[1].strip()
-            return {"english": english_part, "telugu": telugu_part}
+        for model_name in ["gemini-2.5-flash", "gemini-3.8-flash"]:
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=summary_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=300,
+                    ),
+                )
+                if response.text and "---TELUGU---" in response.text:
+                    parts = response.text.split("---TELUGU---")
+                    english_part = parts[0].replace("---ENGLISH---", "").strip()
+                    telugu_part = parts[1].strip()
+                    return {"english": english_part, "telugu": telugu_part}
+            except Exception as e:
+                logger.warning(f"Summary generation error on {model_name}: {e}")
 
         return {"english": transcript_text, "telugu": transcript_text}
