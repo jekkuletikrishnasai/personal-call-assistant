@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 from typing import Optional, Dict, Any, List
 from google import genai
@@ -17,20 +18,21 @@ class CallStateMachine:
         self.turn_count = 0
         self.is_completed = False
 
-        # Initialize Google GenAI Client
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.client = genai.Client(api_key=api_key) if api_key else None
 
     def get_initial_greeting(self) -> str:
-        """Rule 1a: Polite trilingual greeting."""
+        """1a: Polite, professional trilingual greeting."""
         return "Hello, Namaste, Namaskaram! I am an automated assistant answering on behalf of the user. How can I help you today?"
 
     def detect_and_lock_language(self, caller_text: str) -> str:
-        """Rule 1b & 1c: Detect language on Turn 1 and lock permanently."""
+        """1b & 1c: Detect language on Turn 1 and lock permanently."""
+        # Telugu Unicode range or common transliterated words
         has_telugu_script = bool(re.search(r'[\u0C00-\u0C7F]', caller_text))
         telugu_keywords = ["namaskaram", "bagunnara", "cheppandi", "telugu", "enti", "kavalandi", "matladali", "arjent", "urgent"]
         is_telugu = has_telugu_script or any(w in caller_text.lower() for w in telugu_keywords)
 
+        # Devanagari script or common Hindi transliterated words
         has_hindi_script = bool(re.search(r'[\u0900-\u097F]', caller_text))
         hindi_keywords = ["namaste", "kaise ho", "bataye", "hindi", "kya", "bhai", "haan", "baat", "zaroori"]
         is_hindi = has_hindi_script or any(w in caller_text.lower() for w in hindi_keywords)
@@ -53,30 +55,69 @@ class CallStateMachine:
         current_lang = lang_names.get(self.locked_language, "English")
 
         name_instruction = (
-            f"The caller's identity is verified from contacts: '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
+            f"The caller's identity is verified as '{self.contact_name}'. Greet them politely by name. Do NOT ask for their name."
             if self.contact_name
-            else "The caller's name is UNKNOWN. Ask for their full name politely."
+            else "The caller's name is UNKNOWN. Politely ask for their full name during the conversation."
         )
 
         return f"""
 Purpose and Goals:
-You are an automated personal phone call assistant that professionally answers incoming calls on behalf of the user.
-Speak fluently and exclusively in {current_lang}.
+You are an automated personal phone call assistant answering calls on behalf of the user.
+Speak exclusively and fluently in {current_lang}.
 
 Behaviors and Rules:
-1. Language Lock: Transition immediately and maintain all subsequent conversation strictly in {current_lang}. Never switch languages.
+1. Language Lock: Maintain all conversation strictly in {current_lang}. Never switch languages.
 2. Caller Identity: {name_instruction}
-3. Conversational Turns: Keep responses concise, clear, and direct (strictly 1 to 2 short sentences, maximum 25 words).
-4. Direct Connection Guardrail: If asked to connect directly to the user or check availability, politely inform the caller of the user's availability and offer to log a detailed message:
+3. Conversational Cadence: Keep responses concise, clear, and direct. Strictly under 2 short sentences (maximum 25 words).
+4. Direct Connection Guardrail: If asked to speak directly to the user or check availability, say:
    - Telugu: "వారు ప్రస్తుతం అందుబాటులో లేరు. నేను మీ ముఖ్యమైన సమాచారాన్ని నమోదు చేసి వెంటనే వారికి తెలియజేస్తాను."
    - Hindi: "वे अभी उपलब्ध नहीं हैं। मैं आपका संदेश नोट कर लेता हूँ और उन्हें तुरंत सूचित कर दूँगा।"
    - English: "The user is currently unavailable. I would be glad to take a detailed message and notify them immediately."
-5. Gather Details: Inquire politely about the purpose of the call, caller's name (if not known), contact info, and degree of urgency (Urgent vs Standard).
+5. Gather Details: Collect caller name (if unknown), call purpose, contact info, and degree of urgency (Urgent vs Standard).
 6. Verification & Wrap-up:
-   - Once details are gathered, summarize the key points back to the caller in {current_lang} to confirm accuracy.
-   - Thank the caller in {current_lang} and conclude the call courteously (e.g., goodbye, ధన్యవాదాలు, धन्यवाद).
-7. Format: Spoken dialogue only. Never use asterisks (*), markdown, bullet points, or emojis.
+   - Summarize the key points back to the caller in {current_lang} to confirm accuracy.
+   - Thank the caller in {current_lang} and conclude courteousley (e.g., goodbye, ధన్యవాదాలు, धन्यवाद).
+7. Format: Conversational spoken dialogue only. No asterisks, markdown, bullet points, or emojis.
 """
+
+    def _call_gemini_with_fallback(self, prompt: str, max_tokens: int = 80) -> Optional[str]:
+        """Calls Gemini using resilient fallbacks and a retry loop for 503 capacity spikes."""
+        if not self.client:
+            return None
+
+        # Prioritize stable flash and pro models to bypass regional 503 bottlenecks
+        target_models = [
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-pro-latest",
+            "gemini-3.8-flash"
+        ]
+
+        for model_name in target_models:
+            for attempt in range(2):
+                try:
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.2,
+                            max_output_tokens=max_tokens,
+                        ),
+                    )
+                    if response.text:
+                        return re.sub(r'[*_#`]', '', response.text).strip()
+                except Exception as e:
+                    err_msg = str(e)
+                    if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                        logger.warning(f"{model_name} high demand (503). Retrying in 1s...")
+                        time.sleep(1.0)
+                        continue
+                    elif "404" in err_msg or "NOT_FOUND" in err_msg:
+                        logger.info(f"{model_name} not available, trying next candidate...")
+                        break
+                    else:
+                        logger.warning(f"Unexpected error with {model_name}: {e}")
+                        break
+        return None
 
     async def process_turn(self, caller_text: str) -> str:
         self.turn_count += 1
@@ -84,43 +125,21 @@ Behaviors and Rules:
         if not self.locked_language:
             self.detect_and_lock_language(caller_text)
 
-        if not self.client:
-            logger.error("GEMINI_API_KEY environment variable is not configured.")
-            return self._fallback_reply()
-
         self.history.append({"role": "user", "text": caller_text})
 
-        # Format conversation messages for the client
         conversation_context = f"System Instructions:\n{self._build_system_prompt()}\n\n"
         for turn in self.history:
             speaker = "Caller" if turn["role"] == "user" else "Assistant"
             conversation_context += f"{speaker}: {turn['text']}\n"
         conversation_context += "Assistant:"
 
-        # Try active models via official SDK
-        active_models = ["gemini-2.5-flash", "gemini-3.8-flash"]
+        clean_reply = self._call_gemini_with_fallback(conversation_context, max_tokens=80)
 
-        for model_name in active_models:
-            try:
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=conversation_context,
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        max_output_tokens=85,
-                    ),
-                )
-
-                if response.text:
-                    clean_reply = re.sub(r'[*_#`]', '', response.text).strip()
-                    self.history.append({"role": "model", "text": clean_reply})
-
-                    if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
-                        self.is_completed = True
-
-                    return clean_reply
-            except Exception as e:
-                logger.warning(f"SDK call on {model_name} failed: {e}")
+        if clean_reply:
+            self.history.append({"role": "model", "text": clean_reply})
+            if any(w in clean_reply.lower() for w in ["goodbye", "ధన్యవాదాలు", "धन्यवाद", "thank you", "సెలవు"]):
+                self.is_completed = True
+            return clean_reply
 
         return self._fallback_reply()
 
@@ -133,9 +152,6 @@ Behaviors and Rules:
 
     async def generate_bilingual_summary(self) -> Dict[str, str]:
         """Summarizes transcript strictly in English and Telugu."""
-        if not self.client:
-            return {"english": "Summary unavailable", "telugu": "సారాంశం అందుబాటులో లేదు"}
-
         transcript_text = "\n".join([
             f"{'Caller' if m['role'] == 'user' else 'AI'}: {m['text']}"
             for m in self.history
@@ -162,22 +178,12 @@ Message: <details>
 ముఖ్యత: <Urgent/Standard in Telugu>
 సందేశం: <details in Telugu>
 """
-        for model_name in ["gemini-2.5-flash", "gemini-3.8-flash"]:
-            try:
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=summary_prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=300,
-                    ),
-                )
-                if response.text and "---TELUGU---" in response.text:
-                    parts = response.text.split("---TELUGU---")
-                    english_part = parts[0].replace("---ENGLISH---", "").strip()
-                    telugu_part = parts[1].strip()
-                    return {"english": english_part, "telugu": telugu_part}
-            except Exception as e:
-                logger.warning(f"Summary generation error on {model_name}: {e}")
+        summary_result = self._call_gemini_with_fallback(summary_prompt, max_tokens=300)
+
+        if summary_result and "---TELUGU---" in summary_result:
+            parts = summary_result.split("---TELUGU---")
+            english_part = parts[0].replace("---ENGLISH---", "").strip()
+            telugu_part = parts[1].strip()
+            return {"english": english_part, "telugu": telugu_part}
 
         return {"english": transcript_text, "telugu": transcript_text}
